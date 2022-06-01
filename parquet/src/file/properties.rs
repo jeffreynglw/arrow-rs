@@ -157,6 +157,7 @@ pub struct WriterProperties {
     data_page_row_count_limit: usize,
     write_batch_size: usize,
     max_row_group_size: usize,
+    min_row_group_size: usize,
     bloom_filter_position: BloomFilterPosition,
     writer_version: WriterVersion,
     created_by: String,
@@ -252,6 +253,11 @@ impl WriterProperties {
     /// For more details see [`WriterPropertiesBuilder::set_max_row_group_size`]
     pub fn max_row_group_size(&self) -> usize {
         self.max_row_group_size
+    }
+
+    /// Returns minimum number of rows in a row group.
+    pub fn min_row_group_size(&self) -> usize {
+        self.min_row_group_size
     }
 
     /// Returns bloom filter position.
@@ -446,6 +452,7 @@ pub struct WriterPropertiesBuilder {
     data_page_row_count_limit: usize,
     write_batch_size: usize,
     max_row_group_size: usize,
+    min_row_group_size: usize,
     bloom_filter_position: BloomFilterPosition,
     writer_version: WriterVersion,
     created_by: String,
@@ -469,6 +476,7 @@ impl Default for WriterPropertiesBuilder {
             data_page_row_count_limit: DEFAULT_DATA_PAGE_ROW_COUNT_LIMIT,
             write_batch_size: DEFAULT_WRITE_BATCH_SIZE,
             max_row_group_size: DEFAULT_MAX_ROW_GROUP_SIZE,
+            min_row_group_size: DEFAULT_MAX_ROW_GROUP_SIZE,
             bloom_filter_position: DEFAULT_BLOOM_FILTER_POSITION,
             writer_version: DEFAULT_WRITER_VERSION,
             created_by: DEFAULT_CREATED_BY.to_string(),
@@ -494,6 +502,7 @@ impl WriterPropertiesBuilder {
             data_page_row_count_limit: self.data_page_row_count_limit,
             write_batch_size: self.write_batch_size,
             max_row_group_size: self.max_row_group_size,
+            min_row_group_size: self.min_row_group_size,
             bloom_filter_position: self.bloom_filter_position,
             writer_version: self.writer_version,
             created_by: self.created_by,
@@ -576,6 +585,13 @@ impl WriterPropertiesBuilder {
     pub fn set_max_row_group_size(mut self, value: usize) -> Self {
         assert!(value > 0, "Cannot have a 0 max row group size");
         self.max_row_group_size = value;
+        self
+    }
+
+    /// Sets maximum number of rows in a row group.
+    pub fn set_min_row_group_size(mut self, value: usize) -> Self {
+        assert!(value > 0, "Cannot have a 0 min row group size");
+        self.min_row_group_size = value;
         self
     }
 
@@ -953,6 +969,7 @@ impl From<WriterProperties> for WriterPropertiesBuilder {
             data_page_row_count_limit: props.data_page_row_count_limit,
             write_batch_size: props.write_batch_size,
             max_row_group_size: props.max_row_group_size,
+            min_row_group_size: props.min_row_group_size,
             bloom_filter_position: props.bloom_filter_position,
             writer_version: props.writer_version,
             created_by: props.created_by,
