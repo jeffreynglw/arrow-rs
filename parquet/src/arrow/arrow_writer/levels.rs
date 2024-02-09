@@ -135,7 +135,7 @@ enum LevelInfoBuilder {
 impl LevelInfoBuilder {
     /// Create a new [`LevelInfoBuilder`] for the given [`Field`] and parent [`LevelContext`]
     fn try_new(field: &Field, parent_ctx: LevelContext, array: &ArrayRef) -> Result<Self> {
-        if field.data_type() != array.data_type() {
+        if !field.data_type().equals_datatype(array.data_type()) {
             return Err(arrow_err!(format!(
                 "Incompatible type. Field '{}' has type {}, array has type {}",
                 field.name(),
