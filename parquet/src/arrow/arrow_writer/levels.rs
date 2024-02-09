@@ -729,7 +729,7 @@ impl LevelInfoBuilder {
 
         // now that we've got the values from one/both dictionaries, if the values
         // have the same Arrow data type, they're compatible
-        if a == b {
+        if a.equals_datatype(b) {
             return true;
         }
 
