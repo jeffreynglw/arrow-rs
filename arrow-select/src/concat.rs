@@ -469,7 +469,7 @@ pub fn concat(arrays: &[&dyn Array]) -> Result<ArrayRef, ArrowError> {
         return Err(ArrowError::InvalidArgumentError(error_message));
     }
 
-    downcast_primitive! {
+    let result = downcast_primitive! {
         d => (primitive_concat, arrays),
         DataType::Boolean => concat_boolean(arrays),
         DataType::Dictionary(k, _) => {
@@ -503,7 +503,10 @@ pub fn concat(arrays: &[&dyn Array]) -> Result<ArrayRef, ArrowError> {
             let capacity = get_capacity(arrays, d);
             concat_fallback(arrays, capacity)
         }
-    }
+    }?;
+    // Row-reducing/copying paths keep or append input buffer lists; see
+    // take::deep_compact_views.
+    Ok(crate::take::deep_compact_views(result))
 }
 
 /// Concatenates arrays using MutableArrayData

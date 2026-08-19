@@ -93,7 +93,7 @@ pub fn interleave(
         return Ok(new_empty_array(data_type));
     }
 
-    downcast_primitive! {
+    let result = downcast_primitive! {
         data_type => (primitive_helper, values, indices, data_type),
         DataType::Utf8 => interleave_bytes::<Utf8Type>(values, indices),
         DataType::LargeUtf8 => interleave_bytes::<LargeUtf8Type>(values, indices),
@@ -109,7 +109,12 @@ pub fn interleave(
         DataType::List(field) => interleave_list::<i32>(values, indices, field),
         DataType::LargeList(field) => interleave_list::<i64>(values, indices, field),
         _ => interleave_fallback(values, indices)
-    }
+    }?;
+    // `interleave_views` keeps every referenced buffer whole, and the
+    // `MutableArrayData` fallback (which is where `Map` and other nested types
+    // land) keeps the inputs' entire buffer lists. Both leave a small selection
+    // pinning its parents' buffers; see take::deep_compact_views.
+    Ok(crate::take::deep_compact_views(result))
 }
 
 /// Common functionality for interleaving arrays

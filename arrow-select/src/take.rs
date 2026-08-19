@@ -17,6 +17,7 @@
 
 //! Defines take kernel for [Array]
 
+use std::collections::HashMap;
 use std::fmt::Display;
 use std::mem::ManuallyDrop;
 use std::sync::Arc;
@@ -29,7 +30,9 @@ use arrow_buffer::{
     ArrowNativeType, BooleanBuffer, Buffer, MutableBuffer, NullBuffer, OffsetBuffer, ScalarBuffer,
     bit_util,
 };
-use arrow_data::{ArrayDataBuilder, transform::MutableArrayData};
+use arrow_data::{
+    ArrayData, ArrayDataBuilder, ByteView, MAX_INLINE_VIEW_LEN, transform::MutableArrayData,
+};
 use arrow_schema::{ArrowError, DataType, FieldRef, UnionMode};
 
 use num_traits::Zero;
@@ -97,7 +100,7 @@ pub fn take(
                 check_bounds(values.len(), indices)?;
             }
             let indices = indices.to_indices();
-            take_impl(values, &indices)
+            take_impl(values, &indices).map(deep_compact_views)
         },
         d => Err(ArrowError::InvalidArgumentError(format!("Take only supported for integers, got {d:?}")))
     )
@@ -607,6 +610,200 @@ fn take_byte_view<T: ByteViewType, IndexType: ArrowPrimitiveType>(
     Ok(unsafe {
         GenericByteViewArray::new_unchecked(new_views, array.data_buffers().to_vec(), new_nulls)
     })
+}
+
+/// Compact every sparse view array in `array`, however deeply nested.
+/// Returns the input unchanged (same `Arc`) when nothing needs compaction.
+///
+/// `take` keeps the input's entire data-buffer list regardless of how few
+/// rows survive, and `concat` appends every input's list, so a chain of
+/// row-reducing operators (e.g. hash joins) otherwise accumulates every
+/// upstream buffer: the list grows multiplicatively per level and the
+/// buffers stay alive. Applied at the end of the public `take` and `concat`
+/// entry points.
+///
+/// Reachability is judged per view array from its own views; rows a parent
+/// hides (list-view offsets, sliced containers) still count as referenced,
+/// so such children are left alone. They share their child arrays with the
+/// source, so their lists cannot grow through this path either.
+///
+/// Exposed for callers that retain a selection past the lifetime of the batch
+/// it came from, such as a top-N heap or a hash-join build side. Such a caller
+/// knows what the kernels cannot: that the output will outlive its source, so
+/// compaction is worth paying for even when the kernels' own thresholds leave
+/// the array alone.
+pub fn deep_compact_views(array: ArrayRef) -> ArrayRef {
+    if !type_contains_views(array.data_type()) {
+        return array;
+    }
+    match deep_compact_data(&array.to_data()) {
+        Some(data) => make_array(data),
+        None => array,
+    }
+}
+
+/// Recursive worker for [`deep_compact_views`]; `None` means unchanged.
+fn deep_compact_data(data: &ArrayData) -> Option<ArrayData> {
+    match data.data_type() {
+        DataType::Utf8View => {
+            let array = StringViewArray::from(data.clone());
+            compact_byte_view(&array).map(|a| a.into_data())
+        }
+        DataType::BinaryView => {
+            let array = BinaryViewArray::from(data.clone());
+            compact_byte_view(&array).map(|a| a.into_data())
+        }
+        dt if type_contains_views(dt) => {
+            let mut changed = false;
+            let children: Vec<ArrayData> = data
+                .child_data()
+                .iter()
+                .map(|child| match deep_compact_data(child) {
+                    Some(new) => {
+                        changed = true;
+                        new
+                    }
+                    None => child.clone(),
+                })
+                .collect();
+            if !changed {
+                return None;
+            }
+            // SAFETY: same type, length, offset, buffers, and nulls as
+            // `data`, which was valid; each child is replaced by a logically
+            // identical compacted array of the same length.
+            Some(unsafe {
+                data.clone()
+                    .into_builder()
+                    .child_data(children)
+                    .build_unchecked()
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Threshold below which a view array is left alone: bounded retention
+/// this small is cheaper than scanning the views, and buffer lists this
+/// short cannot be mid-compounding (each level multiplies the list).
+const COMPACT_MIN_CAPACITY: usize = 1024 * 1024;
+const COMPACT_MAX_SKIP_BUFFERS: usize = 16;
+
+/// Bound what a view array retains beyond what its views reference.
+/// Returns `None` when the array is left unchanged.
+///
+/// Two stages. Unreferenced and duplicate buffers are dropped and the view
+/// indices remapped, copying no data; this is what stops buffer lists from
+/// compounding through chained `take`/`concat`. `gc()` then copies the
+/// referenced bytes only when the kept buffers hold more than twice the
+/// referenced bytes and the excess exceeds [`COMPACT_MIN_CAPACITY`], so
+/// retention is bounded, not eliminated: an array can keep up to
+/// `max(2x referenced, referenced + COMPACT_MIN_CAPACITY)` alive.
+fn compact_byte_view<T: ByteViewType>(
+    array: &GenericByteViewArray<T>,
+) -> Option<GenericByteViewArray<T>> {
+    let buffers = array.data_buffers();
+    if buffers.is_empty() {
+        return None;
+    }
+    // Cheap gate before the O(views) scan: small, short-listed arrays are
+    // not worth touching (typical outputs of already-compact batches).
+    let total_capacity: usize = buffers.iter().map(|b| b.capacity()).sum();
+    if total_capacity <= COMPACT_MIN_CAPACITY && buffers.len() <= COMPACT_MAX_SKIP_BUFFERS {
+        return None;
+    }
+
+    // One pass over the views: bytes referenced and which buffers are used.
+    let mut used_bytes: usize = 0;
+    let mut referenced = vec![false; buffers.len()];
+    for v in array.views().iter() {
+        let len = *v as u32;
+        if len > MAX_INLINE_VIEW_LEN {
+            let view = ByteView::from(*v);
+            used_bytes += len as usize;
+            // A view pointing outside the buffer list means the array
+            // skipped validation; leave it alone rather than panic.
+            match referenced.get_mut(view.buffer_index as usize) {
+                Some(slot) => *slot = true,
+                None => return None,
+            }
+        }
+    }
+
+    // Keep one entry per referenced allocation (`concat` clones the same
+    // buffer once per input) and remember each old index's replacement.
+    let mut kept: Vec<Buffer> = Vec::new();
+    let mut kept_capacity: usize = 0;
+    let mut by_alloc: HashMap<(usize, usize), u32> = HashMap::new();
+    let mut remap: Vec<u32> = vec![u32::MAX; buffers.len()];
+    for (i, buffer) in buffers.iter().enumerate() {
+        if !referenced[i] {
+            continue;
+        }
+        let key = (buffer.as_ptr() as usize, buffer.len());
+        remap[i] = *by_alloc.entry(key).or_insert_with(|| {
+            kept_capacity += buffer.capacity();
+            kept.push(buffer.clone());
+            (kept.len() - 1) as u32
+        });
+    }
+
+    // Copy only when the excess is both relatively (2x) and absolutely
+    // large; mid-selectivity takes stay zero-copy.
+    //
+    // NOTE: the decision deliberately ignores how many holders the kept
+    // buffers have, even though a copy frees nothing unless this array is the
+    // last holder. Inside a kernel the caller still owns the input, so such a
+    // check could essentially never fire, and it would skip exactly the case
+    // that matters: an output that is retained while its source batch is
+    // dropped right after the call. Waste is the only signal available here.
+    // A consumer calling `deep_compact_views` at the point it stores a batch
+    // can make the sharper decision.
+    let waste = kept_capacity.saturating_sub(used_bytes);
+    if kept_capacity > used_bytes.saturating_mul(2) && waste > COMPACT_MIN_CAPACITY {
+        return Some(array.gc());
+    }
+    if kept.len() == buffers.len() {
+        return None;
+    }
+
+    let views: Vec<u128> = array
+        .views()
+        .iter()
+        .map(|v| {
+            let len = *v as u32;
+            if len > MAX_INLINE_VIEW_LEN {
+                let mut view = ByteView::from(*v);
+                view.buffer_index = remap[view.buffer_index as usize];
+                view.as_u128()
+            } else {
+                *v
+            }
+        })
+        .collect();
+    // SAFETY: every remapped index points at a clone of the buffer the view
+    // pointed at before; inline views and nulls are unchanged.
+    Some(unsafe { GenericByteViewArray::new_unchecked(views.into(), kept, array.nulls().cloned()) })
+}
+
+fn type_contains_views(dt: &DataType) -> bool {
+    match dt {
+        DataType::Utf8View | DataType::BinaryView => true,
+        DataType::Struct(fields) => fields.iter().any(|f| type_contains_views(f.data_type())),
+        DataType::List(f)
+        | DataType::LargeList(f)
+        | DataType::ListView(f)
+        | DataType::LargeListView(f)
+        | DataType::FixedSizeList(f, _)
+        | DataType::Map(f, _) => type_contains_views(f.data_type()),
+        DataType::Union(fields, _) => fields
+            .iter()
+            .any(|(_, f)| type_contains_views(f.data_type())),
+        // Dictionary values are shared wholesale by `take` (no list growth),
+        // and RunEndEncoded values are taken through the public `take`,
+        // which compacts them; neither needs an arm here.
+        _ => false,
+    }
 }
 
 /// `take` implementation for list arrays
@@ -2841,5 +3038,394 @@ mod tests {
             .expect("result should be a RunArray");
         assert_eq!(run_result.run_ends().len(), 0);
         assert_eq!(run_result.values().len(), 0);
+    }
+
+    /// Sum of data-buffer capacities retained by a view array.
+    fn view_buffer_capacity<T: ByteViewType>(v: &GenericByteViewArray<T>) -> usize {
+        v.data_buffers().iter().map(|b| b.capacity()).sum()
+    }
+
+    /// A 40k-row string-view array whose values are long enough (> 12 bytes)
+    /// to live in data buffers rather than inline in the views, and big
+    /// enough overall to exceed the compaction skip gate.
+    fn big_string_view() -> StringViewArray {
+        (0..40_000)
+            .map(|i| Some(format!("row-{i}-{}", "x".repeat(50))))
+            .collect()
+    }
+
+    /// `take` of a few rows must not retain the input's full data buffers.
+    /// Regression test for buffer-list compounding through chained hash
+    /// joins (take clones the entire buffer list into every output batch).
+    #[test]
+    fn test_take_compacts_sparse_string_view() {
+        let big = big_string_view();
+        let taken = take(&big, &UInt32Array::from(vec![3u32, 7]), None).unwrap();
+        let v = taken.as_string_view();
+        assert_eq!(v.len(), 2);
+        assert_eq!(v.value(0), big.value(3));
+        assert_eq!(v.value(1), big.value(7));
+        // Unreferenced buffers are pruned; what remains is bounded.
+        assert!(
+            v.data_buffers().len() <= 2,
+            "{} buffers kept",
+            v.data_buffers().len()
+        );
+        let capacity = view_buffer_capacity(v);
+        assert!(
+            capacity <= 1024 * 1024,
+            "take output retains {capacity} buffer bytes for 2 rows"
+        );
+        // Negative control: a dense take (all rows) must NOT copy.
+        let all: UInt32Array = (0..40_000u32).collect();
+        let dense = take(&big, &all, None).unwrap();
+        let dense = dense.as_string_view();
+        // dense output reuses the input's buffers zero-copy (no gc copy)
+        assert_eq!(dense.data_buffers().len(), big.data_buffers().len());
+        assert_eq!(
+            dense.data_buffers()[0].as_ptr(),
+            big.data_buffers()[0].as_ptr()
+        );
+    }
+
+    /// `concat` of sparse slices must not retain every input's full buffer
+    /// list (the CollectLeft build-side collect path).
+    #[test]
+    fn test_concat_compacts_sparse_string_view() {
+        use crate::concat::concat;
+        let big = big_string_view();
+        let a = big.slice(0, 2);
+        let b = big.slice(5, 2);
+        let out = concat(&[&a, &b]).unwrap();
+        let v = out.as_string_view();
+        assert_eq!(v.len(), 4);
+        assert_eq!(v.value(0), big.value(0));
+        assert_eq!(v.value(2), big.value(5));
+        assert!(
+            v.data_buffers().len() <= 2,
+            "{} buffers kept",
+            v.data_buffers().len()
+        );
+        let capacity = view_buffer_capacity(v);
+        assert!(
+            capacity <= 1024 * 1024,
+            "concat output retains {capacity} buffer bytes for 4 rows"
+        );
+    }
+
+    /// Views nested inside container types (here map<string,string>) take a
+    /// different code path (`MutableArrayData`) than top-level views and
+    /// must also be compacted.
+    #[test]
+    fn test_take_compacts_sparse_views_nested_in_map() {
+        let mut builder = MapBuilder::new(None, StringViewBuilder::new(), StringViewBuilder::new());
+        for i in 0..20_000 {
+            builder
+                .keys()
+                .append_value(format!("key-{i}-{}", "k".repeat(50)));
+            builder
+                .values()
+                .append_value(format!("val-{i}-{}", "v".repeat(50)));
+            builder.append(true).unwrap();
+        }
+        let map = builder.finish();
+        let taken = take(&map, &UInt32Array::from(vec![3u32, 7]), None).unwrap();
+        let entries = taken.as_map().entries();
+        let keys = entries.column(0).as_string_view();
+        assert_eq!(keys.value(0), format!("key-3-{}", "k".repeat(50)));
+        assert_eq!(keys.value(1), format!("key-7-{}", "k".repeat(50)));
+        for col in entries.columns() {
+            let v = col.as_string_view();
+            let capacity = view_buffer_capacity(v);
+            assert!(
+                capacity <= 1024 * 1024,
+                "nested view column retains {capacity} buffer bytes for 2 rows"
+            );
+        }
+    }
+
+    /// Top-level views already prune inside `interleave_views`, so this pins
+    /// the properties the added compaction pass must not break: values stay
+    /// correct, and a dense selection still shares its source's buffers
+    /// rather than paying a copy.
+    #[test]
+    fn test_interleave_compacts_sparse_string_view() {
+        use crate::interleave::interleave;
+        let a = big_string_view();
+        let b = big_string_view();
+        let out = interleave(&[&a, &b], &[(0, 3), (1, 7), (0, 11)]).unwrap();
+        let v = out.as_string_view();
+        assert_eq!(v.len(), 3);
+        assert_eq!(v.value(0), a.value(3));
+        assert_eq!(v.value(1), b.value(7));
+        assert_eq!(v.value(2), a.value(11));
+        let capacity = view_buffer_capacity(v);
+        assert!(
+            capacity <= 1024 * 1024,
+            "interleave output retains {capacity} buffer bytes for 3 rows"
+        );
+        // Negative control: taking every row from one source references all
+        // of its buffers, so there is nothing to prune and nothing is copied.
+        let all: Vec<(usize, usize)> = (0..a.len()).map(|i| (0, i)).collect();
+        let dense = interleave(&[&a, &b], &all).unwrap();
+        let dense = dense.as_string_view();
+        assert_eq!(dense.data_buffers().len(), a.data_buffers().len());
+        assert_eq!(dense.data_buffers()[0].as_ptr(), a.data_buffers()[0].as_ptr());
+    }
+
+    /// `Map` is absent from `interleave`'s dispatch, so it falls to
+    /// `interleave_fallback` -> `MutableArrayData`, which keeps the inputs'
+    /// entire buffer lists. Nested view columns must compact there too.
+    #[test]
+    fn test_interleave_compacts_sparse_views_nested_in_map() {
+        use crate::interleave::interleave;
+        let mut builder = MapBuilder::new(None, StringViewBuilder::new(), StringViewBuilder::new());
+        for i in 0..20_000 {
+            builder
+                .keys()
+                .append_value(format!("key-{i}-{}", "k".repeat(50)));
+            builder
+                .values()
+                .append_value(format!("val-{i}-{}", "v".repeat(50)));
+            builder.append(true).unwrap();
+        }
+        let map = builder.finish();
+        let out = interleave(&[&map, &map], &[(0, 3), (1, 7)]).unwrap();
+        let entries = out.as_map().entries();
+        let keys = entries.column(0).as_string_view();
+        assert_eq!(keys.value(0), format!("key-3-{}", "k".repeat(50)));
+        assert_eq!(keys.value(1), format!("key-7-{}", "k".repeat(50)));
+        for col in entries.columns() {
+            let v = col.as_string_view();
+            let capacity = view_buffer_capacity(v);
+            assert!(
+                capacity <= 1024 * 1024,
+                "nested view column retains {capacity} buffer bytes for 2 rows"
+            );
+        }
+    }
+
+    /// `concat` of clones of one array must dedup the repeated buffers with
+    /// no data copy (the CollectLeft build-side collect shape).
+    #[test]
+    fn test_concat_dedups_repeated_buffers_without_copy() {
+        use crate::concat::concat;
+        let big = big_string_view();
+        let inputs: Vec<&dyn Array> = (0..8).map(|_| &big as &dyn Array).collect();
+        let out = concat(&inputs).unwrap();
+        let v = out.as_string_view();
+        assert_eq!(v.len(), 320_000);
+        assert_eq!(v.value(3), big.value(3));
+        assert_eq!(v.value(280_007), big.value(7));
+        // the same buffers, each kept once, not copied
+        assert_eq!(v.data_buffers().len(), big.data_buffers().len());
+        assert_eq!(v.data_buffers()[0].as_ptr(), big.data_buffers()[0].as_ptr());
+    }
+
+    /// `take` on a list-view shares the full values child, whose own views
+    /// reference every buffer, so there is nothing to prune at the leaf
+    /// (reachability through the parent's offsets is not projected). The
+    /// shared child also means the buffer list cannot grow through take;
+    /// this pins values staying correct and retention not growing.
+    #[test]
+    fn test_take_on_list_view_keeps_values_correct_without_growth() {
+        let mut builder = ListViewBuilder::new(StringViewBuilder::new());
+        for i in 0..20_000 {
+            builder
+                .values()
+                .append_value(format!("row-{i}-{}", "x".repeat(50)));
+            builder.append(true);
+        }
+        let list = builder.finish();
+        let input_capacity = view_buffer_capacity(list.values().as_string_view());
+        let taken = take(&list, &UInt32Array::from(vec![3u32, 7]), None).unwrap();
+        let taken = taken.as_list_view::<i32>();
+        assert_eq!(
+            taken.value(0).as_string_view().value(0),
+            format!("row-3-{}", "x".repeat(50))
+        );
+        let values = taken.values().as_string_view();
+        assert!(view_buffer_capacity(values) <= input_capacity);
+    }
+
+    /// Null map slots must survive compaction intact.
+    #[test]
+    fn test_take_compacts_map_with_null_slots() {
+        let mut builder = MapBuilder::new(None, StringViewBuilder::new(), StringViewBuilder::new());
+        for i in 0..10_000 {
+            if i % 3 == 0 {
+                builder.append(false).unwrap();
+            } else {
+                builder
+                    .keys()
+                    .append_value(format!("key-{i}-{}", "k".repeat(50)));
+                builder
+                    .values()
+                    .append_value(format!("val-{i}-{}", "v".repeat(50)));
+                builder.append(true).unwrap();
+            }
+        }
+        let map = builder.finish();
+        let taken = take(&map, &UInt32Array::from(vec![3u32, 4, 6]), None).unwrap();
+        let m = taken.as_map();
+        assert!(m.is_null(0), "row 3 was a null map slot");
+        assert!(m.is_null(2), "row 6 was a null map slot");
+        let entries = m.value(1);
+        let keys = entries.column(0).as_string_view();
+        assert_eq!(keys.value(0), format!("key-4-{}", "k".repeat(50)));
+    }
+
+    /// A single huge buffer that only a few views reference must be copied
+    /// down (the prune stage alone cannot shrink it).
+    #[test]
+    fn test_take_copies_when_pruning_cannot_shrink() {
+        // gc() the builder output first so all values live in one buffer.
+        let big: StringViewArray = (0..40_000)
+            .map(|i| Some(format!("row-{i}-{}", "x".repeat(50))))
+            .collect();
+        let big = big.gc();
+        assert_eq!(big.data_buffers().len(), 1);
+        let taken = take(&big, &UInt32Array::from(vec![3u32, 7]), None).unwrap();
+        let v = taken.as_string_view();
+        assert_eq!(v.value(0), big.value(3));
+        let capacity = view_buffer_capacity(v);
+        let used = v.total_buffer_bytes_used();
+        assert!(
+            capacity <= used * 2,
+            "sparse take of one huge buffer retains {capacity} bytes for {used} referenced"
+        );
+    }
+
+    /// Two distinct surviving buffers must keep their views pointing at the
+    /// right one after duplicates are pruned (guards the index remap).
+    #[test]
+    fn test_concat_remap_preserves_values_across_surviving_buffers() {
+        use crate::concat::concat;
+        let a: StringViewArray = (0..12_000)
+            .map(|i| Some(format!("a-{i}-{}", "a".repeat(50))))
+            .collect();
+        let a = a.gc();
+        let b: StringViewArray = (0..12_000)
+            .map(|i| Some(format!("b-{i}-{}", "b".repeat(50))))
+            .collect();
+        let b = b.gc();
+        // a appears twice: its buffer entry must dedup, b's must survive,
+        // and every view must land on the right buffer afterwards.
+        let out = concat(&[&a, &b, &a]).unwrap();
+        let v = out.as_string_view();
+        assert_eq!(v.data_buffers().len(), 2);
+        assert_eq!(v.value(3), a.value(3));
+        assert_eq!(v.value(12_003), b.value(3));
+        assert_eq!(v.value(24_003), a.value(3));
+    }
+
+    /// Null slots must survive the prune/remap path.
+    #[test]
+    fn test_take_compaction_preserves_nulls_in_view_column() {
+        let big: StringViewArray = (0..40_000)
+            .map(|i| {
+                if i % 2 == 0 {
+                    Some(format!("row-{i}-{}", "x".repeat(50)))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let taken = take(&big, &UInt32Array::from(vec![2u32, 3, 4]), None).unwrap();
+        let v = taken.as_string_view();
+        assert_eq!(v.value(0), big.value(2));
+        assert!(v.is_null(1));
+        assert_eq!(v.value(2), big.value(4));
+        assert!(view_buffer_capacity(v) <= 1024 * 1024);
+    }
+
+    /// Union children are taken per child without compaction, so the deep
+    /// pass must descend into unions too.
+    #[test]
+    fn test_take_compacts_sparse_views_nested_in_union() {
+        use std::sync::Arc;
+        let strings: StringViewArray = (0..20_000)
+            .map(|i| Some(format!("row-{i}-{}", "x".repeat(50))))
+            .collect();
+        let fields = [(0i8, Arc::new(Field::new("s", DataType::Utf8View, false)))]
+            .into_iter()
+            .collect::<UnionFields>();
+        let type_ids = vec![0i8; 20_000].into();
+        let union =
+            UnionArray::try_new(fields, type_ids, None, vec![Arc::new(strings.clone())]).unwrap();
+        let taken = take(&union, &UInt32Array::from(vec![3u32, 7]), None).unwrap();
+        let u = taken.as_union();
+        assert_eq!(u.value(0).as_string_view().value(0), strings.value(3));
+        let child = u.child(0).as_string_view();
+        let capacity = view_buffer_capacity(child);
+        assert!(
+            capacity <= 1024 * 1024,
+            "union view child retains {capacity} buffer bytes for 2 rows"
+        );
+    }
+
+    /// Reproduces the compounding this change bounds, and prints the numbers.
+    ///
+    /// Each level mimics one hash-join level: `concat` merges the buffer lists
+    /// of 16 probe-partition batches, then `take` selects the same small row
+    /// count back out and clones the merged list into the output. The row count
+    /// is constant across levels, so anything that grows is pure retention.
+    ///
+    /// ```text
+    /// cargo test -p arrow-select --release compounding -- --ignored --nocapture
+    ///
+    /// level 0: 64 rows,  8 buffers, 4177920 bytes retained
+    /// level 1: 64 rows,  1 buffers,   16384 bytes retained
+    /// level 2: 64 rows, 16 buffers,  262144 bytes retained
+    /// level 3: 64 rows,  1 buffers,   16384 bytes retained
+    /// level 4: 64 rows, 16 buffers,  262144 bytes retained
+    /// ```
+    ///
+    /// The saw-tooth is the skip gate: a merged list within both
+    /// `COMPACT_MIN_CAPACITY` and `COMPACT_MAX_SKIP_BUFFERS` is left alone, and
+    /// the next level's merge crosses the gate and collapses back to one buffer.
+    ///
+    /// For the unfixed baseline, drop the `deep_compact_views` call at the end
+    /// of `take()` and `concat()` and raise the bound asserted below. That gives
+    /// 128 / 2048 / 32768 buffers and 66.8 MB / 1.07 GB / 17.1 GB over three
+    /// levels. Stop at three: the figure is buffer-list capacity, which the
+    /// harness reaches by re-merging one source array, and a real plan whose
+    /// partitions hold distinct buffers pays it in resident memory.
+    #[test]
+    #[ignore = "measurement harness, prints per-level retention"]
+    fn compounding_across_levels_stays_bounded() {
+        const LEVELS: usize = 4;
+        const FANOUT: usize = 16;
+
+        let source = big_string_view();
+        let mut cur: ArrayRef = Arc::new(source.slice(0, 64));
+        let rows = cur.len();
+        let indices: UInt32Array = (0..rows as u32).collect();
+
+        println!(
+            "level 0: {rows} rows, {} buffers, {} bytes retained",
+            cur.as_string_view().data_buffers().len(),
+            view_buffer_capacity(cur.as_string_view())
+        );
+
+        for level in 1..=LEVELS {
+            let inputs = vec![cur.as_ref(); FANOUT];
+            let merged = crate::concat::concat(&inputs).unwrap();
+            cur = take(&merged, &indices, None).unwrap();
+
+            let v = cur.as_string_view();
+            let (buffers, bytes) = (v.data_buffers().len(), view_buffer_capacity(v));
+            println!(
+                "level {level}: {} rows, {buffers} buffers, {bytes} bytes retained",
+                v.len()
+            );
+
+            assert_eq!(v.len(), rows, "row count must stay constant");
+            assert_eq!(v.value(0), source.value(0));
+            assert!(
+                bytes <= 4 * 1024 * 1024,
+                "level {level} retains {bytes} bytes for {rows} rows"
+            );
+        }
     }
 }
