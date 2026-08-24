@@ -29,7 +29,7 @@ use arrow_buffer::{
     ArrowNativeType, BooleanBuffer, Buffer, MutableBuffer, NullBuffer, OffsetBuffer, ScalarBuffer,
     bit_util,
 };
-use arrow_data::{ArrayDataBuilder, transform::MutableArrayData};
+use arrow_data::{ArrayDataBuilder, ByteView, MAX_INLINE_VIEW_LEN, transform::MutableArrayData};
 use arrow_schema::{ArrowError, DataType, FieldRef, UnionMode};
 
 use num_traits::Zero;
@@ -603,10 +603,71 @@ fn take_byte_view<T: ByteViewType, IndexType: ArrowPrimitiveType>(
 ) -> Result<GenericByteViewArray<T>, ArrowError> {
     let new_views = take_native(array.views(), indices);
     let new_nulls = take_nulls(array.nulls(), indices);
+    let (new_views, new_buffers) = prune_view_buffers(new_views, array.data_buffers());
     // Safety:  array.views was valid, and take_native copies only valid values, and verifies bounds
-    Ok(unsafe {
-        GenericByteViewArray::new_unchecked(new_views, array.data_buffers().to_vec(), new_nulls)
-    })
+    Ok(unsafe { GenericByteViewArray::new_unchecked(new_views, new_buffers, new_nulls) })
+}
+
+/// Drops the data buffers that no view in `views` points at, remapping the views that
+/// survive.
+///
+/// A selection out of a view array copies the whole buffer list, so the output holds
+/// every byte of the input's data alive however few rows it took. A buffer no view
+/// resolves against is unreachable through the output and is dropped here. No bytes are
+/// copied and no value changes: only the buffer index inside each view is rewritten.
+///
+/// If a view does not resolve against `buffers` at all, the whole list is kept as it is,
+/// rather than remapping views onto a list they never matched.
+fn prune_view_buffers(
+    views: ScalarBuffer<u128>,
+    buffers: &[Buffer],
+) -> (ScalarBuffer<u128>, Vec<Buffer>) {
+    // Null slots are scanned along with the rest: `take_native` copies the source view
+    // into a null slot verbatim, and a view kept in the output must keep resolving.
+    let mut referenced = vec![false; buffers.len()];
+    let mut referenced_count = 0;
+    for v in views.iter() {
+        let view = ByteView::from(*v);
+        if view.length <= MAX_INLINE_VIEW_LEN {
+            continue;
+        }
+        match referenced.get_mut(view.buffer_index as usize) {
+            Some(slot) => {
+                if !*slot {
+                    *slot = true;
+                    referenced_count += 1;
+                }
+            }
+            None => return (views, buffers.to_vec()),
+        }
+    }
+
+    if referenced_count == buffers.len() {
+        return (views, buffers.to_vec());
+    }
+
+    let mut remap = vec![u32::MAX; buffers.len()];
+    let mut kept = Vec::with_capacity(referenced_count);
+    for (old_index, buffer) in buffers.iter().enumerate() {
+        if referenced[old_index] {
+            remap[old_index] = kept.len() as u32;
+            kept.push(buffer.clone());
+        }
+    }
+
+    let remapped: Vec<u128> = views
+        .iter()
+        .map(|v| {
+            let view = ByteView::from(*v);
+            if view.length <= MAX_INLINE_VIEW_LEN {
+                return *v;
+            }
+            view.with_buffer_index(remap[view.buffer_index as usize])
+                .as_u128()
+        })
+        .collect();
+
+    (remapped.into(), kept)
 }
 
 /// `take` implementation for list arrays
@@ -2841,5 +2902,97 @@ mod tests {
             .expect("result should be a RunArray");
         assert_eq!(run_result.run_ends().len(), 0);
         assert_eq!(run_result.values().len(), 0);
+    }
+
+    /// Builds a `StringViewArray` whose values are spread over `values.len()` data
+    /// buffers, one value per buffer.
+    fn one_buffer_per_value(values: &[&str]) -> StringViewArray {
+        let block_size = values.iter().map(|v| v.len()).max().unwrap() as u32;
+        let mut builder = StringViewBuilder::new().with_fixed_block_size(block_size);
+        for v in values {
+            assert!(
+                v.len() > MAX_INLINE_VIEW_LEN as usize,
+                "{v} would be inlined"
+            );
+            builder.append_value(v);
+        }
+        builder.finish()
+    }
+
+    #[test]
+    fn test_take_byte_view_prunes_unreferenced_buffers() {
+        let array = one_buffer_per_value(&[
+            "first value, not inlined",
+            "second value, not inlined",
+            "third value, not inlined",
+        ]);
+        assert_eq!(array.data_buffers().len(), 3);
+
+        let taken = take(&array, &UInt32Array::from(vec![1, 1]), None).unwrap();
+        let taken = taken.as_string_view();
+
+        // Only the buffer holding row 1 is reachable through the output.
+        assert_eq!(taken.data_buffers().len(), 1);
+        assert_eq!(taken.value(0), "second value, not inlined");
+        assert_eq!(taken.value(1), "second value, not inlined");
+        // Negative control: taking every row keeps every buffer.
+        let all = take(&array, &UInt32Array::from(vec![0, 1, 2]), None).unwrap();
+        assert_eq!(all.as_string_view().data_buffers().len(), 3);
+    }
+
+    #[test]
+    fn test_take_byte_view_pruning_does_not_copy_data() {
+        let array = one_buffer_per_value(&["first value, not inlined", "second, not inlined"]);
+        let kept = array.data_buffers()[1].as_ptr();
+
+        let taken = take(&array, &UInt32Array::from(vec![1]), None).unwrap();
+        let taken = taken.as_string_view();
+
+        assert_eq!(taken.data_buffers().len(), 1);
+        assert_eq!(taken.data_buffers()[0].as_ptr(), kept);
+    }
+
+    #[test]
+    fn test_take_byte_view_pruning_preserves_nulls() {
+        let mut builder = StringViewBuilder::new().with_fixed_block_size(32);
+        builder.append_value("first value, not inlined");
+        builder.append_null();
+        builder.append_value("second value, not inlined");
+        let array = builder.finish();
+        assert!(array.data_buffers().len() > 1);
+
+        let taken = take(
+            &array,
+            &UInt32Array::from(vec![Some(1), Some(2), None]),
+            None,
+        )
+        .unwrap();
+        let taken = taken.as_string_view();
+
+        assert_eq!(taken.null_count(), 2);
+        assert!(taken.is_null(0));
+        assert_eq!(taken.value(1), "second value, not inlined");
+        assert!(taken.is_null(2));
+    }
+
+    #[test]
+    fn test_take_byte_view_keeps_buffers_for_views_past_the_buffer_list() {
+        let views: ScalarBuffer<u128> = vec![
+            ByteView::new(20, b"abcd").with_buffer_index(7).as_u128(),
+            ByteView::new(20, b"abcd").with_buffer_index(0).as_u128(),
+        ]
+        .into();
+        let buffers = vec![Buffer::from(vec![0u8; 32]), Buffer::from(vec![1u8; 32])];
+        // SAFETY: the first view is deliberately unresolvable; nothing below reads a value.
+        let array = unsafe { StringViewArray::new_unchecked(views, buffers, None) };
+
+        // Row 0 carries the unresolvable view into the output.
+        let taken = take(&array, &UInt32Array::from(vec![0, 1]), None).unwrap();
+        let taken = taken.as_string_view();
+
+        // The buffer list is left exactly as it was rather than remapped or truncated.
+        assert_eq!(taken.data_buffers().len(), 2);
+        assert_eq!(ByteView::from(taken.views()[0]).buffer_index, 7);
+        assert_eq!(ByteView::from(taken.views()[1]).buffer_index, 0);
     }
 }

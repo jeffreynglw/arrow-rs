@@ -562,6 +562,7 @@ mod tests {
     use super::*;
     use arrow_array::builder::{
         GenericListBuilder, Int64Builder, ListViewBuilder, StringDictionaryBuilder,
+        StringViewBuilder,
     };
     use arrow_schema::{Field, Schema};
     use std::fmt::Debug;
@@ -1899,5 +1900,25 @@ mod tests {
         let values = result_run_array.values().as_primitive::<Int32Type>();
         assert_eq!(values.values(), &[10, 20, 30]);
         assert_eq!(&[2, 3, 5], run_ends);
+    }
+
+    #[test]
+    fn test_concat_views_dedupes_buffers_shared_between_inputs() {
+        let mut builder = StringViewBuilder::new().with_fixed_block_size(32);
+        builder.append_value("first value, not inlined");
+        builder.append_value("second value, not inlined");
+        let array = builder.finish();
+        assert_eq!(array.data_buffers().len(), 2);
+
+        let left = array.slice(0, 1);
+        let right = array.slice(1, 1);
+        let combined = concat(&[&left, &right, &left]).unwrap();
+        let combined = combined.as_string_view();
+
+        // Each input only reaches one buffer, and the two inputs between them reach two.
+        assert_eq!(combined.data_buffers().len(), 2);
+        assert_eq!(combined.value(0), "first value, not inlined");
+        assert_eq!(combined.value(1), "second value, not inlined");
+        assert_eq!(combined.value(2), "first value, not inlined");
     }
 }

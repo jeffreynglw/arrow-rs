@@ -27,6 +27,7 @@ use arrow_buffer::{ArrowNativeType, BooleanBuffer, MutableBuffer, NullBuffer, Of
 use arrow_data::ByteView;
 use arrow_data::transform::MutableArrayData;
 use arrow_schema::{ArrowError, DataType, FieldRef, Fields};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 macro_rules! primitive_helper {
@@ -304,6 +305,11 @@ fn interleave_views<T: ByteViewType>(
 
     // contains the mapping from old buffer index to new buffer index
     let mut buffer_to_new_index = vec![None; total_buffers];
+    // The same allocation often appears under several input indices, because the inputs
+    // are themselves selections over one source. The position memo above cannot see
+    // that, so it would append one copy of the buffer per input. Collapse them on
+    // allocation identity, pointer plus length, which is what a view resolves against.
+    let mut identity_to_new_index: HashMap<(usize, usize), u32> = HashMap::new();
 
     let views: Vec<u128> = indices
         .iter()
@@ -317,11 +323,20 @@ fn interleave_views<T: ByteViewType>(
             // value is big enough to be in a variadic buffer
             let view = ByteView::from(*view);
             let buffer_to_new_idx = offsets[*array_idx] + view.buffer_index as usize;
-            let new_buffer_idx: u32 =
-                *buffer_to_new_index[buffer_to_new_idx].get_or_insert_with(|| {
-                    buffers.push(array.data_buffers()[view.buffer_index as usize].clone());
-                    (buffers.len() - 1) as u32
-                });
+            let new_buffer_idx: u32 = match buffer_to_new_index[buffer_to_new_idx] {
+                Some(idx) => idx,
+                None => {
+                    let buffer = &array.data_buffers()[view.buffer_index as usize];
+                    let idx = *identity_to_new_index
+                        .entry((buffer.as_ptr() as usize, buffer.len()))
+                        .or_insert_with(|| {
+                            buffers.push(buffer.clone());
+                            (buffers.len() - 1) as u32
+                        });
+                    buffer_to_new_index[buffer_to_new_idx] = Some(idx);
+                    idx
+                }
+            };
             view.with_buffer_index(new_buffer_idx).as_u128()
         })
         .collect();
@@ -580,7 +595,9 @@ pub fn interleave_record_batch(
 mod tests {
     use super::*;
     use arrow_array::Int32RunArray;
-    use arrow_array::builder::{GenericListBuilder, Int32Builder, PrimitiveRunBuilder};
+    use arrow_array::builder::{
+        GenericListBuilder, Int32Builder, PrimitiveRunBuilder, StringViewBuilder,
+    };
     use arrow_array::types::Int8Type;
     use arrow_buffer::ScalarBuffer;
     use arrow_schema::Field;
@@ -1543,5 +1560,50 @@ mod tests {
             result_lv.value(2).as_primitive::<Int64Type>().values(),
             &[3]
         );
+    }
+
+    #[test]
+    fn test_interleave_views_dedupes_buffers_shared_between_inputs() {
+        let mut builder = StringViewBuilder::new().with_fixed_block_size(32);
+        builder.append_value("first value, not inlined");
+        builder.append_value("second value, not inlined");
+        let array = builder.finish();
+        assert_eq!(array.data_buffers().len(), 2);
+
+        // Both inputs are the same array, so each of its two buffers is reached under two
+        // different input positions.
+        let left = array.slice(0, 2);
+        let right = array.slice(0, 2);
+
+        let values = interleave(&[&left, &right], &[(0, 0), (1, 0), (0, 1), (1, 1)]).unwrap();
+        let values = values.as_string_view();
+
+        // Two buffers, not the four a position-keyed list would hold, and no copy was made.
+        assert_eq!(values.data_buffers().len(), 2);
+        let sources: Vec<_> = array.data_buffers().iter().map(|b| b.as_ptr()).collect();
+        for buffer in values.data_buffers() {
+            assert!(sources.contains(&buffer.as_ptr()));
+        }
+        assert_eq!(values.value(0), "first value, not inlined");
+        assert_eq!(values.value(1), "first value, not inlined");
+        assert_eq!(values.value(2), "second value, not inlined");
+        assert_eq!(values.value(3), "second value, not inlined");
+    }
+
+    #[test]
+    fn test_interleave_views_keeps_distinct_buffers_apart() {
+        let mut left = StringViewBuilder::new();
+        left.append_value("first value, not inlined");
+        let left = left.finish();
+        let mut right = StringViewBuilder::new();
+        right.append_value("second value, not inlined");
+        let right = right.finish();
+
+        let values = interleave(&[&left, &right], &[(0, 0), (1, 0)]).unwrap();
+        let values = values.as_string_view();
+
+        assert_eq!(values.data_buffers().len(), 2);
+        assert_eq!(values.value(0), "first value, not inlined");
+        assert_eq!(values.value(1), "second value, not inlined");
     }
 }

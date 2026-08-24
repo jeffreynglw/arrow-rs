@@ -16,6 +16,7 @@
 // under the License.
 
 use std::any::Any;
+use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
@@ -88,6 +89,13 @@ pub struct GenericByteViewBuilder<T: ByteViewType + ?Sized> {
     /// map `<string hash> -> <index to the views>`
     string_tracker: Option<(HashTable<usize>, ahash::RandomState)>,
     max_deduplication_len: Option<u32>,
+    /// Index in `completed` of every data buffer taken from an array by
+    /// [`GenericByteViewBuilder::append_array`], keyed on the buffer's allocation
+    /// identity: its pointer and length.
+    ///
+    /// Cleared by [`GenericByteViewBuilder::finish`] along with `completed`, so a key
+    /// never outlives the buffer that keeps its address reserved.
+    appended_buffers: HashMap<(usize, usize), u32>,
     phantom: PhantomData<T>,
 }
 
@@ -109,6 +117,7 @@ impl<T: ByteViewType + ?Sized> GenericByteViewBuilder<T> {
             },
             string_tracker: None,
             max_deduplication_len: None,
+            appended_buffers: HashMap::new(),
             phantom: Default::default(),
         }
     }
@@ -220,25 +229,70 @@ impl<T: ByteViewType + ?Sized> GenericByteViewBuilder<T> {
     /// Appends an array to the builder.
     /// This will flush any in-progress block and append the data buffers
     /// and add the (adapted) views.
+    ///
+    /// Only the data buffers the appended views actually point at are taken, and a
+    /// buffer that is the same allocation as one already taken is reused instead of
+    /// being taken again. Repeatedly appending arrays that share buffers, which is what
+    /// happens when the inputs are selections over one source, therefore does not grow
+    /// the buffer list by one copy of that source per input. No bytes are copied: only
+    /// the buffer index inside each appended view is rewritten.
     pub fn append_array(&mut self, array: &GenericByteViewArray<T>) {
         self.flush_in_progress();
-        // keep original views if this array is the first to be added or if there are no data buffers (all inline views)
-        let keep_views = self.completed.is_empty() || array.data_buffers().is_empty();
-        let starting_buffer = self.completed.len() as u32;
 
-        self.completed.extend(array.data_buffers().iter().cloned());
+        let data_buffers = array.data_buffers();
+        let mut referenced = vec![false; data_buffers.len()];
+        // A view whose buffer index falls outside the array's own buffer list cannot be
+        // remapped onto a pruned list, so such an array keeps the older behaviour: the
+        // whole list is taken under one flat offset.
+        let mut resolves = true;
+        for v in array.views() {
+            let byte_view = ByteView::from(*v);
+            // Small views (<=12 bytes) are inlined and reference no buffer.
+            if byte_view.length <= MAX_INLINE_VIEW_LEN {
+                continue;
+            }
+            match referenced.get_mut(byte_view.buffer_index as usize) {
+                Some(slot) => *slot = true,
+                None => {
+                    resolves = false;
+                    break;
+                }
+            }
+        }
+
+        let mut remap = vec![u32::MAX; data_buffers.len()];
+        if resolves {
+            for (old_index, buffer) in data_buffers.iter().enumerate() {
+                if referenced[old_index] {
+                    remap[old_index] = self.intern_buffer(buffer);
+                }
+            }
+        } else {
+            let starting_buffer = self.completed.len() as u32;
+            for (old_index, buffer) in data_buffers.iter().enumerate() {
+                remap[old_index] = starting_buffer + old_index as u32;
+                self.push_completed(buffer.clone());
+            }
+        }
+
+        // Keeping the original views is only correct while the remap is the identity,
+        // which needs every buffer to have been both kept and left at its own index.
+        let keep_views = remap
+            .iter()
+            .enumerate()
+            .all(|(old_index, new_index)| *new_index == old_index as u32);
 
         if keep_views {
             self.views_buffer.extend_from_slice(array.views());
         } else {
             self.views_buffer.extend(array.views().iter().map(|v| {
-                let mut byte_view = ByteView::from(*v);
-                if byte_view.length > MAX_INLINE_VIEW_LEN {
-                    // Small views (<=12 bytes) are inlined, so only need to update large views
-                    byte_view.buffer_index += starting_buffer;
-                };
-
-                byte_view.as_u128()
+                let byte_view = ByteView::from(*v);
+                if byte_view.length <= MAX_INLINE_VIEW_LEN {
+                    return *v;
+                }
+                byte_view
+                    .with_buffer_index(remap[byte_view.buffer_index as usize])
+                    .as_u128()
             }));
         }
 
@@ -247,6 +301,19 @@ impl<T: ByteViewType + ?Sized> GenericByteViewBuilder<T> {
         } else {
             self.null_buffer_builder.append_n_non_nulls(array.len());
         }
+    }
+
+    /// Returns the index in `completed` of `block`, appending it only if this exact
+    /// allocation is not already there.
+    fn intern_buffer(&mut self, block: &Buffer) -> u32 {
+        let key = (block.as_ptr() as usize, block.len());
+        if let Some(index) = self.appended_buffers.get(&key) {
+            return *index;
+        }
+        let index = self.completed.len() as u32;
+        self.push_completed(block.clone());
+        self.appended_buffers.insert(key, index);
+        index
     }
 
     /// Try to append a view of the given `block`, `offset` and `length`
@@ -488,6 +555,7 @@ impl<T: ByteViewType + ?Sized> GenericByteViewBuilder<T> {
     pub fn finish(&mut self) -> GenericByteViewArray<T> {
         self.flush_in_progress();
         let completed = std::mem::take(&mut self.completed);
+        self.appended_buffers.clear();
         let nulls = self.null_buffer_builder.finish();
         if let Some((ht, _)) = self.string_tracker.as_mut() {
             ht.clear();
@@ -712,6 +780,7 @@ mod tests {
     use arrow_buffer::ArrowNativeType;
 
     use super::*;
+    use crate::StringViewArray;
 
     #[test]
     fn test_string_max_deduplication_len() {
@@ -1002,5 +1071,125 @@ mod tests {
         assert_eq!(array.len(), 2);
         assert_eq!(array.value(0), "first");
         assert_eq!(array.value(1), "second");
+    }
+
+    /// Builds a `StringViewArray` whose values are spread over `values.len()` data
+    /// buffers, one value per buffer.
+    fn one_buffer_per_value(values: &[&str]) -> StringViewArray {
+        let block_size = values.iter().map(|v| v.len()).max().unwrap() as u32;
+        let mut builder = StringViewBuilder::new().with_fixed_block_size(block_size);
+        for v in values {
+            assert!(
+                v.len() > MAX_INLINE_VIEW_LEN as usize,
+                "{v} would be inlined"
+            );
+            builder.append_value(v);
+        }
+        builder.finish()
+    }
+
+    #[test]
+    fn test_append_array_dedupes_buffers_shared_between_arrays() {
+        let array = one_buffer_per_value(&["first value, not inlined", "second, not inlined"]);
+        let sources: Vec<_> = array.data_buffers().iter().map(|b| b.as_ptr()).collect();
+
+        let mut builder = StringViewBuilder::new();
+        builder.append_array(&array);
+        builder.append_array(&array);
+        let out = builder.finish();
+
+        // One list, not one per appended array, and no bytes were copied.
+        assert_eq!(out.data_buffers().len(), 2);
+        for buffer in out.data_buffers() {
+            assert!(sources.contains(&buffer.as_ptr()));
+        }
+        assert_eq!(out.len(), 4);
+        for i in 0..4 {
+            assert_eq!(out.value(i), array.value(i % 2));
+        }
+    }
+
+    #[test]
+    fn test_append_array_prunes_unreferenced_buffers() {
+        let array = one_buffer_per_value(&[
+            "first value, not inlined",
+            "second value, not inlined",
+            "third value, not inlined",
+        ]);
+        assert_eq!(array.data_buffers().len(), 3);
+
+        let mut builder = StringViewBuilder::new();
+        builder.append_array(&array.slice(1, 1));
+        let out = builder.finish();
+
+        assert_eq!(out.data_buffers().len(), 1);
+        assert_eq!(out.value(0), "second value, not inlined");
+
+        // Negative control: appending the whole array keeps all three.
+        let mut builder = StringViewBuilder::new();
+        builder.append_array(&array);
+        assert_eq!(builder.finish().data_buffers().len(), 3);
+    }
+
+    #[test]
+    fn test_append_array_preserves_nulls() {
+        let mut builder = StringViewBuilder::new().with_fixed_block_size(32);
+        builder.append_value("first value, not inlined");
+        builder.append_null();
+        builder.append_value("second value, not inlined");
+        let array = builder.finish();
+
+        let mut builder = StringViewBuilder::new();
+        builder.append_array(&array);
+        builder.append_array(&array);
+        let out = builder.finish();
+
+        assert_eq!(out.len(), 6);
+        assert_eq!(out.null_count(), 2);
+        for i in 0..6 {
+            match i % 3 {
+                1 => assert!(out.is_null(i)),
+                other => assert_eq!(out.value(i), array.value(other)),
+            }
+        }
+    }
+
+    #[test]
+    fn test_append_array_keeps_buffers_for_views_past_the_buffer_list() {
+        let views: ScalarBuffer<u128> = vec![
+            ByteView::new(20, b"abcd").with_buffer_index(7).as_u128(),
+            ByteView::new(20, b"abcd").with_buffer_index(0).as_u128(),
+        ]
+        .into();
+        let buffers = vec![Buffer::from(vec![0u8; 32]), Buffer::from(vec![1u8; 32])];
+        // SAFETY: the first view is deliberately unresolvable; nothing below reads a value.
+        let array = unsafe { StringViewArray::new_unchecked(views, buffers, None) };
+
+        let mut builder = StringViewBuilder::new();
+        builder.append_array(&array);
+        let out = builder.finish();
+
+        // Whole list taken under a flat offset, and the views left as they were.
+        assert_eq!(out.data_buffers().len(), 2);
+        assert_eq!(ByteView::from(out.views()[0]).buffer_index, 7);
+        assert_eq!(ByteView::from(out.views()[1]).buffer_index, 0);
+    }
+
+    #[test]
+    fn test_append_array_buffer_memo_is_cleared_by_finish() {
+        let array = one_buffer_per_value(&["first value, not inlined"]);
+
+        let mut builder = StringViewBuilder::new();
+        builder.append_array(&array);
+        let first = builder.finish();
+        // Reusing the builder must not map the same allocation onto an index from the
+        // buffer list that `finish` already took away.
+        builder.append_array(&array);
+        let second = builder.finish();
+
+        assert_eq!(first.data_buffers().len(), 1);
+        assert_eq!(second.data_buffers().len(), 1);
+        assert_eq!(first.value(0), "first value, not inlined");
+        assert_eq!(second.value(0), "first value, not inlined");
     }
 }
