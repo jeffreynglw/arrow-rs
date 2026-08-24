@@ -561,7 +561,7 @@ pub fn concat_batches<'a>(
 mod tests {
     use super::*;
     use arrow_array::builder::{
-        GenericListBuilder, Int64Builder, ListViewBuilder, StringDictionaryBuilder,
+        GenericListBuilder, Int64Builder, ListViewBuilder, MapBuilder, StringDictionaryBuilder,
         StringViewBuilder,
     };
     use arrow_schema::{Field, Schema};
@@ -1920,5 +1920,46 @@ mod tests {
         assert_eq!(combined.value(0), "first value, not inlined");
         assert_eq!(combined.value(1), "second value, not inlined");
         assert_eq!(combined.value(2), "first value, not inlined");
+    }
+    #[test]
+    fn test_concat_map_of_views_dedupes_buffers_shared_between_inputs() {
+        let mut builder = MapBuilder::new(
+            None,
+            StringViewBuilder::new().with_fixed_block_size(20),
+            StringViewBuilder::new().with_fixed_block_size(20),
+        );
+        for i in 0..2 {
+            builder.keys().append_value(format!("key-{i}, not inlined"));
+            builder
+                .values()
+                .append_value(format!("val-{i}, not inlined"));
+            builder.append(true).unwrap();
+        }
+        let array = builder.finish();
+        assert_eq!(map_key_buffers(&array), 2);
+
+        // `Map` has no arm in the dispatch and lands in `concat_fallback`. Slicing
+        // keeps the whole entries child, so each input carries both buffers.
+        let left = array.slice(0, 1);
+        let right = array.slice(1, 1);
+        let combined = concat(&[&left, &right, &left]).unwrap();
+        let combined = combined.as_map();
+
+        // Two buffers across the three inputs, not the six a per-input list holds.
+        assert_eq!(map_key_buffers(combined), 2);
+        let keys = combined.entries().column(0).as_string_view();
+        assert_eq!(keys.value(0), "key-0, not inlined");
+        assert_eq!(keys.value(1), "key-1, not inlined");
+        assert_eq!(keys.value(2), "key-0, not inlined");
+    }
+
+    /// Data buffers of the key child of a `map<utf8view, utf8view>`.
+    fn map_key_buffers(array: &MapArray) -> usize {
+        array
+            .entries()
+            .column(0)
+            .as_string_view()
+            .data_buffers()
+            .len()
     }
 }

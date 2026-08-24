@@ -2995,4 +2995,80 @@ mod tests {
         assert_eq!(ByteView::from(taken.views()[0]).buffer_index, 7);
         assert_eq!(ByteView::from(taken.views()[1]).buffer_index, 0);
     }
+
+    /// Builds a `list<utf8view>` with one value per list entry, each value in its
+    /// own data buffer, so the child's buffer list has one entry per row.
+    fn list_of_views_one_buffer_per_row(values: &[&str]) -> ListArray {
+        let block_size = values.iter().map(|v| v.len()).max().unwrap() as u32;
+        let mut builder =
+            ListBuilder::new(StringViewBuilder::new().with_fixed_block_size(block_size));
+        for v in values {
+            assert!(
+                v.len() > MAX_INLINE_VIEW_LEN as usize,
+                "{v} would be inlined"
+            );
+            builder.values().append_value(v);
+            builder.append(true);
+        }
+        builder.finish()
+    }
+
+    /// Data buffers of the `Utf8View` child of a `list<utf8view>`.
+    fn child_view_buffers(array: &ListArray) -> usize {
+        array.values().as_string_view().data_buffers().len()
+    }
+
+    #[test]
+    fn test_take_nested_views_prunes_unreferenced_buffers() {
+        let array = list_of_views_one_buffer_per_row(&[
+            "first value, not inlined",
+            "second value, not inlined",
+            "third value, not inlined",
+        ]);
+        assert_eq!(child_view_buffers(&array), 3);
+
+        let taken = take(&array, &UInt32Array::from(vec![1]), None).unwrap();
+        let taken = taken.as_list::<i32>();
+
+        // A `list` goes through `MutableArrayData`, which used to take every data
+        // buffer of every input before knowing which rows were wanted.
+        assert_eq!(child_view_buffers(taken), 1);
+        assert_eq!(
+            taken.value(0).as_string_view().value(0),
+            "second value, not inlined"
+        );
+
+        // Negative control: taking every row still needs all three.
+        let all = take(&array, &UInt32Array::from(vec![0, 1, 2]), None).unwrap();
+        assert_eq!(child_view_buffers(all.as_list::<i32>()), 3);
+    }
+
+    #[test]
+    fn test_take_nested_views_preserves_nulls() {
+        let block_size = 32;
+        let mut builder =
+            ListBuilder::new(StringViewBuilder::new().with_fixed_block_size(block_size));
+        builder.values().append_value("first value, not inlined");
+        builder.append(true);
+        builder.append_null();
+        builder.values().append_value("third value, not inlined");
+        builder.append(true);
+        let array = builder.finish();
+
+        let taken = take(
+            &array,
+            &UInt32Array::from(vec![Some(2), Some(1), None]),
+            None,
+        )
+        .unwrap();
+        let taken = taken.as_list::<i32>();
+
+        assert_eq!(child_view_buffers(taken), 1);
+        assert_eq!(
+            taken.value(0).as_string_view().value(0),
+            "third value, not inlined"
+        );
+        assert!(taken.is_null(1));
+        assert!(taken.is_null(2));
+    }
 }

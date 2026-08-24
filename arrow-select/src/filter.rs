@@ -2350,4 +2350,48 @@ mod tests {
         let filter = FilterBuilder::new(&predicate).build();
         filter_native(&values, &filter);
     }
+    /// Builds a `list<utf8view>` with one value per list entry, each value in its
+    /// own data buffer, so the child's buffer list has one entry per row.
+    fn list_of_views_one_buffer_per_row(values: &[&str]) -> ListArray {
+        let block_size = values.iter().map(|v| v.len()).max().unwrap() as u32;
+        let mut builder =
+            ListBuilder::new(StringViewBuilder::new().with_fixed_block_size(block_size));
+        for v in values {
+            assert!(v.len() > 12, "{v} would be inlined");
+            builder.values().append_value(v);
+            builder.append(true);
+        }
+        builder.finish()
+    }
+
+    /// Data buffers of the `Utf8View` child of a `list<utf8view>`.
+    fn child_view_buffers(array: &ListArray) -> usize {
+        array.values().as_string_view().data_buffers().len()
+    }
+
+    #[test]
+    fn test_filter_nested_views_prunes_unreferenced_buffers() {
+        let array = list_of_views_one_buffer_per_row(&[
+            "first value, not inlined",
+            "second value, not inlined",
+            "third value, not inlined",
+        ]);
+        assert_eq!(child_view_buffers(&array), 3);
+
+        let mask = BooleanArray::from(vec![false, true, false]);
+        let filtered = filter(&array, &mask).unwrap();
+        let filtered = filtered.as_list::<i32>();
+
+        // `filter` on a nested type goes through `MutableArrayData`, which used to
+        // take every data buffer of every input regardless of the mask.
+        assert_eq!(child_view_buffers(filtered), 1);
+        assert_eq!(
+            filtered.value(0).as_string_view().value(0),
+            "second value, not inlined"
+        );
+
+        // Negative control: an all-true mask still needs all three.
+        let all = filter(&array, &BooleanArray::from(vec![true, true, true])).unwrap();
+        assert_eq!(child_view_buffers(all.as_list::<i32>()), 3);
+    }
 }

@@ -20,13 +20,14 @@
 //! Provides utilities for creating, manipulating, and converting Arrow arrays
 //! made of primitive types, strings, and nested types.
 
-use super::{ArrayData, ArrayDataBuilder, ByteView, data::new_buffers};
+use super::{ArrayData, ArrayDataBuilder, ByteView, MAX_INLINE_VIEW_LEN, data::new_buffers};
 use crate::bit_mask::set_bits;
 use arrow_buffer::buffer::{BooleanBuffer, NullBuffer};
 use arrow_buffer::{ArrowNativeType, Buffer, MutableBuffer, bit_util, i256};
 use arrow_schema::{ArrowError, DataType, IntervalUnit, UnionMode};
 use half::f16;
 use num_integer::Integer;
+use std::collections::HashMap;
 use std::mem;
 
 mod boolean;
@@ -64,6 +65,27 @@ struct _MutableArrayData<'a> {
     pub buffer1: MutableBuffer,
     pub buffer2: MutableBuffer,
     pub child_data: Vec<MutableArrayData<'a>>,
+
+    /// Variadic data buffers referenced by the views written to `buffer1`.
+    ///
+    /// Unlike the other output buffers this one is filled by
+    /// [`build_extend_view`] rather than being known up front, because which
+    /// of an input's data buffers the output needs is only known once
+    /// [`MutableArrayData::extend`] has said which rows are wanted. Taking
+    /// them all up front pins every byte of every input behind however few
+    /// rows survive, and composes multiplicatively through chained
+    /// row-reducing operators.
+    pub variadic_data_buffers: Vec<Buffer>,
+
+    /// For each input array, the index in `variadic_data_buffers` assigned to
+    /// each of that array's data buffers, or `None` while no view has needed
+    /// it. Empty for types that have no data buffers.
+    pub variadic_buffer_map: Vec<Vec<Option<u32>>>,
+
+    /// Index in `variadic_data_buffers` of each distinct allocation already
+    /// taken, keyed on its pointer and length: the same buffer reached through
+    /// two inputs is one entry, not two.
+    pub variadic_buffer_identity: HashMap<(usize, usize), u32>,
 }
 
 impl _MutableArrayData<'_> {
@@ -71,6 +93,39 @@ impl _MutableArrayData<'_> {
         self.null_buffer
             .as_mut()
             .expect("MutableArrayData not nullable")
+    }
+
+    /// Returns the output buffer index for data buffer `buffer_index` of input
+    /// array `array_index`, taking the buffer on first sight.
+    ///
+    /// `data_buffers` is that input's own data buffers, i.e. its buffers past
+    /// the views.
+    fn variadic_buffer_index(
+        &mut self,
+        array_index: usize,
+        buffer_index: usize,
+        data_buffers: &[Buffer],
+    ) -> u32 {
+        match self.variadic_buffer_map[array_index].get(buffer_index) {
+            Some(Some(assigned)) => *assigned,
+            Some(None) => {
+                let buffer = &data_buffers[buffer_index];
+                let key = (buffer.as_ptr() as usize, buffer.len());
+                let assigned = *self.variadic_buffer_identity.entry(key).or_insert_with(|| {
+                    self.variadic_data_buffers.push(buffer.clone());
+                    (self.variadic_data_buffers.len() - 1) as u32
+                });
+                self.variadic_buffer_map[array_index][buffer_index] = Some(assigned);
+                assigned
+            }
+            // NOTE: a view pointing outside its own array's buffer list means
+            // the input skipped validation. There is no buffer to take and no
+            // index that resolves, so the output gets one that stays out of
+            // range: an unresolvable input yields a detectably unresolvable
+            // output rather than an index that silently reads another input's
+            // bytes.
+            None => u32::MAX,
+        }
     }
 }
 
@@ -154,13 +209,6 @@ pub struct MutableArrayData<'a> {
     /// constant and only needed at the end, when freezing [_MutableArrayData].
     dictionary: Option<ArrayData>,
 
-    /// Variadic data buffers referenced by views.
-    ///
-    /// Note this this is not stored in `_MutableArrayData` because these values
-    /// are constant and only needed at the end, when freezing
-    /// [_MutableArrayData]
-    variadic_data_buffers: Vec<Buffer>,
-
     /// function used to extend output array with values from input arrays.
     ///
     /// This function's lifetime is bound to the input arrays because it reads
@@ -215,22 +263,26 @@ fn build_extend_dictionary(array: &ArrayData, offset: usize, max: usize) -> Opti
     }
 }
 
-/// Builds an extend that adds `buffer_offset` to any buffer indices encountered
-fn build_extend_view(array: &ArrayData, buffer_offset: u32) -> Extend<'_> {
+/// Builds an extend that takes each data buffer the extended views point at,
+/// on first sight, and rewrites those views' buffer indices to match.
+fn build_extend_view(array: &ArrayData) -> Extend<'_> {
     let views = array.buffer::<u128>(0);
+    let data_buffers = &array.buffers()[1..];
     Box::new(
-        move |mutable: &mut _MutableArrayData, _, start: usize, len: usize| {
-            mutable
-                .buffer1
-                .extend(views[start..start + len].iter().map(|v| {
-                    let len = *v as u32;
-                    if len <= 12 {
-                        return *v; // Stored inline
-                    }
-                    let mut view = ByteView::from(*v);
-                    view.buffer_index += buffer_offset;
-                    view.into()
-                }))
+        move |mutable: &mut _MutableArrayData, index: usize, start: usize, len: usize| {
+            mutable.buffer1.reserve(len * mem::size_of::<u128>());
+            for v in &views[start..start + len] {
+                let view = ByteView::from(*v);
+                if view.length <= MAX_INLINE_VIEW_LEN {
+                    mutable.buffer1.push(*v); // Stored inline
+                    continue;
+                }
+                let buffer_index =
+                    mutable.variadic_buffer_index(index, view.buffer_index as usize, data_buffers);
+                mutable
+                    .buffer1
+                    .push(view.with_buffer_index(buffer_index).as_u128());
+            }
         },
     )
 }
@@ -638,11 +690,12 @@ impl<'a> MutableArrayData<'a> {
             _ => (None, false),
         };
 
-        let variadic_data_buffers = match &data_type {
+        // One slot per input data buffer, all unassigned: `build_extend_view`
+        // fills them in as the extended views ask for them.
+        let variadic_buffer_map: Vec<Vec<Option<u32>>> = match &data_type {
             DataType::BinaryView | DataType::Utf8View => arrays
                 .iter()
-                .flat_map(|x| x.buffers().iter().skip(1))
-                .map(Buffer::clone)
+                .map(|x| vec![None; x.buffers().len() - 1])
                 .collect(),
             _ => vec![],
         };
@@ -680,18 +733,7 @@ impl<'a> MutableArrayData<'a> {
                 extend_values.expect("MutableArrayData::new is infallible")
             }
             DataType::BinaryView | DataType::Utf8View => {
-                let mut next_offset = 0u32;
-                arrays
-                    .iter()
-                    .map(|arr| {
-                        let num_data_buffers = (arr.buffers().len() - 1) as u32;
-                        let offset = next_offset;
-                        next_offset = next_offset
-                            .checked_add(num_data_buffers)
-                            .expect("view buffer index overflow");
-                        build_extend_view(arr, offset)
-                    })
-                    .collect()
+                arrays.iter().map(|arr| build_extend_view(arr)).collect()
             }
             _ => arrays.iter().map(|array| build_extend(array)).collect(),
         };
@@ -704,12 +746,14 @@ impl<'a> MutableArrayData<'a> {
             buffer1,
             buffer2,
             child_data,
+            variadic_data_buffers: vec![],
+            variadic_buffer_map,
+            variadic_buffer_identity: HashMap::new(),
         };
         Self {
             arrays,
             data,
             dictionary,
-            variadic_data_buffers,
             extend_values,
             extend_null_bits,
             extend_nulls,
@@ -785,7 +829,7 @@ impl<'a> MutableArrayData<'a> {
                 vec![]
             }
             DataType::BinaryView | DataType::Utf8View => {
-                let mut b = self.variadic_data_buffers;
+                let mut b = data.variadic_data_buffers;
                 b.insert(0, data.buffer1.into());
                 b
             }

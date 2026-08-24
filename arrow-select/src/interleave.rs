@@ -596,7 +596,7 @@ mod tests {
     use super::*;
     use arrow_array::Int32RunArray;
     use arrow_array::builder::{
-        GenericListBuilder, Int32Builder, PrimitiveRunBuilder, StringViewBuilder,
+        GenericListBuilder, Int32Builder, MapBuilder, PrimitiveRunBuilder, StringViewBuilder,
     };
     use arrow_array::types::Int8Type;
     use arrow_buffer::ScalarBuffer;
@@ -1032,8 +1032,10 @@ mod tests {
 
         let fallback = interleave_fallback(&[&view_a, &view_b], indices).unwrap();
         let fallback_result = fallback.as_string_view();
-        // note that fallback_result has 2 buffers, but only one long enough string to warrant a buffer
-        assert_eq!(fallback_result.data_buffers().len(), 2);
+        // The fallback used to keep both inputs' buffers, though only one of the
+        // interleaved strings is long enough to live in one. It now takes only the
+        // buffers its own views point at, so both paths agree.
+        assert_eq!(fallback_result.data_buffers().len(), 1);
 
         // Convert to strings for easier assertion
         let collected: Vec<_> = result.iter().map(|x| x.map(|s| s.to_string())).collect();
@@ -1605,5 +1607,39 @@ mod tests {
         assert_eq!(values.data_buffers().len(), 2);
         assert_eq!(values.value(0), "first value, not inlined");
         assert_eq!(values.value(1), "second value, not inlined");
+    }
+    #[test]
+    fn test_interleave_map_of_views_prunes_unreferenced_buffers() {
+        let mut builder = MapBuilder::new(
+            None,
+            StringViewBuilder::new().with_fixed_block_size(20),
+            StringViewBuilder::new().with_fixed_block_size(20),
+        );
+        for i in 0..3 {
+            builder.keys().append_value(format!("key-{i}, not inlined"));
+            builder
+                .values()
+                .append_value(format!("val-{i}, not inlined"));
+            builder.append(true).unwrap();
+        }
+        let array = builder.finish();
+        let entries = array.entries();
+        assert_eq!(entries.column(0).as_string_view().data_buffers().len(), 3);
+
+        // `Map` has no arm in the dispatch and lands in `interleave_fallback`.
+        let values = interleave(&[&array], &[(0, 2)]).unwrap();
+        let values = values.as_map();
+        let entries = values.entries();
+
+        assert_eq!(entries.column(0).as_string_view().data_buffers().len(), 1);
+        assert_eq!(entries.column(1).as_string_view().data_buffers().len(), 1);
+        assert_eq!(
+            entries.column(0).as_string_view().value(0),
+            "key-2, not inlined"
+        );
+        assert_eq!(
+            entries.column(1).as_string_view().value(0),
+            "val-2, not inlined"
+        );
     }
 }
