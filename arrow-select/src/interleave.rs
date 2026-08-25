@@ -309,7 +309,13 @@ fn interleave_views<T: ByteViewType>(
     // are themselves selections over one source. The position memo above cannot see
     // that, so it would append one copy of the buffer per input. Collapse them on
     // allocation identity, pointer plus length, which is what a view resolves against.
-    let mut identity_to_new_index: HashMap<(usize, usize), u32> = HashMap::new();
+    // ahash rather than the std default. The positional cache above means this is
+    // probed once per distinct (input, buffer) pair rather than once per row, but an
+    // array with thousands of small buffers still pays thousands of probes and
+    // SipHash dominates them. Indices come from push order into `buffers`, not from
+    // map order, so the output is unchanged.
+    let mut identity_to_new_index: HashMap<(usize, usize), u32, ahash::RandomState> =
+        HashMap::default();
 
     let views: Vec<u128> = indices
         .iter()

@@ -636,6 +636,13 @@ fn prune_view_buffers(
                 if !*slot {
                     *slot = true;
                     referenced_count += 1;
+                    // Stop as soon as every buffer is claimed. No view seen later can
+                    // change the outcome, so this returns the same result as completing
+                    // the scan; a dense selection reaches it after a handful of rows
+                    // instead of walking the whole array.
+                    if referenced_count == buffers.len() {
+                        return (views, buffers.to_vec());
+                    }
                 }
             }
             None => return (views, buffers.to_vec()),

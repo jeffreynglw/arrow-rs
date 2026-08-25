@@ -95,7 +95,11 @@ pub struct GenericByteViewBuilder<T: ByteViewType + ?Sized> {
     ///
     /// Cleared by [`GenericByteViewBuilder::finish`] along with `completed`, so a key
     /// never outlives the buffer that keeps its address reserved.
-    appended_buffers: HashMap<(usize, usize), u32>,
+    // ahash rather than the std default: the keys are (pointer, length) pairs probed
+    // once per buffer, and SipHash dominates the append cost on an array with many
+    // small buffers. Indices come from push order, not map order, so the output is
+    // unchanged.
+    appended_buffers: HashMap<(usize, usize), u32, ahash::RandomState>,
     phantom: PhantomData<T>,
 }
 
@@ -117,7 +121,7 @@ impl<T: ByteViewType + ?Sized> GenericByteViewBuilder<T> {
             },
             string_tracker: None,
             max_deduplication_len: None,
-            appended_buffers: HashMap::new(),
+            appended_buffers: HashMap::default(),
             phantom: Default::default(),
         }
     }
@@ -245,6 +249,7 @@ impl<T: ByteViewType + ?Sized> GenericByteViewBuilder<T> {
         // remapped onto a pruned list, so such an array keeps the older behaviour: the
         // whole list is taken under one flat offset.
         let mut resolves = true;
+        let mut referenced_count = 0;
         for v in array.views() {
             let byte_view = ByteView::from(*v);
             // Small views (<=12 bytes) are inlined and reference no buffer.
@@ -252,7 +257,18 @@ impl<T: ByteViewType + ?Sized> GenericByteViewBuilder<T> {
                 continue;
             }
             match referenced.get_mut(byte_view.buffer_index as usize) {
-                Some(slot) => *slot = true,
+                Some(slot) => {
+                    if !*slot {
+                        *slot = true;
+                        referenced_count += 1;
+                        // Every buffer is claimed, so no later view can change which
+                        // ones are kept. Stopping here returns the same result as
+                        // scanning the rest, and a dense array reaches it early.
+                        if referenced_count == data_buffers.len() {
+                            break;
+                        }
+                    }
+                }
                 None => {
                     resolves = false;
                     break;
