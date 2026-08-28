@@ -196,6 +196,7 @@ pub struct ArrowWriter<W: Write> {
 
     /// The maximum number of rows to write to each row group, or None for unlimited
     max_row_group_row_count: Option<usize>,
+    min_row_group_row_count: Option<usize>,
 
     /// The maximum size in bytes for a row group, or None for unlimited
     max_row_group_bytes: Option<usize>,
@@ -213,6 +214,7 @@ impl<W: Write + Send> std::fmt::Debug for ArrowWriter<W> {
             .field("in_progress_rows", &self.in_progress_rows())
             .field("arrow_schema", &self.arrow_schema)
             .field("max_row_group_row_count", &self.max_row_group_row_count)
+            .field("min_row_group_row_count", &self.min_row_group_row_count)
             .field("max_row_group_bytes", &self.max_row_group_bytes)
             .finish()
     }
@@ -262,6 +264,7 @@ impl<W: Write + Send> ArrowWriter<W> {
         }
 
         let max_row_group_row_count = props.max_row_group_row_count();
+        let min_row_group_row_count = props.min_row_group_row_count().or(max_row_group_row_count);
         let max_row_group_bytes = props.max_row_group_bytes();
 
         let props_ptr = Arc::new(props);
@@ -293,6 +296,7 @@ impl<W: Write + Send> ArrowWriter<W> {
             arrow_schema,
             row_group_writer_factory,
             max_row_group_row_count,
+            min_row_group_row_count,
             max_row_group_bytes,
             cdc_chunkers,
         })
@@ -418,8 +422,8 @@ impl<W: Write + Send> ArrowWriter<W> {
         }
 
         let should_flush = self
-            .max_row_group_row_count
-            .is_some_and(|max| in_progress.buffered_rows >= max)
+            .min_row_group_row_count
+            .is_some_and(|min| in_progress.buffered_rows >= min)
             || self
                 .max_row_group_bytes
                 .is_some_and(|max| in_progress.get_estimated_total_bytes() >= max);
